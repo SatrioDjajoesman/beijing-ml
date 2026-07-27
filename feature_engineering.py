@@ -21,7 +21,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-DEFAULT_DB_PATH = Path(__file__).parent.parent / "esp32" / "sensor_data.db"
+from db_path import default_db_path
+
+DEFAULT_DB_PATH = default_db_path()
 
 # Rolling window sizes, expressed as pandas time offsets.
 WINDOWS = ["30s", "2min", "10min"]

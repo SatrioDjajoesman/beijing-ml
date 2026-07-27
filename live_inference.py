@@ -37,6 +37,7 @@ import joblib
 import pandas as pd
 import websockets
 
+from db_path import default_db_path
 from feature_engineering import (
     WINDOWS,
     add_pressure_deltas,
@@ -46,7 +47,7 @@ from feature_engineering import (
 )
 from time_to_leak import ANOMALY_THRESHOLD, estimate_time_to_leak, fit_trend, format_duration, primary_driver
 
-DEFAULT_DB_PATH = Path(__file__).parent.parent / "esp32" / "sensor_data.db"
+DEFAULT_DB_PATH = default_db_path()
 MODELS_DIR = Path(__file__).parent / "models"
 POSITIONS = ["start", "middle", "end"]
 

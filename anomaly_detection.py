@@ -21,7 +21,9 @@ import joblib
 import pandas as pd
 from sklearn.ensemble import IsolationForest
 
-DEFAULT_DB_PATH = Path(__file__).parent.parent / "esp32" / "sensor_data.db"
+from db_path import default_db_path
+
+DEFAULT_DB_PATH = default_db_path()
 MODELS_DIR = Path(__file__).parent / "models"
 POSITIONS = ["start", "middle", "end"]
 
