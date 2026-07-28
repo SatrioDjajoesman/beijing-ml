@@ -37,6 +37,7 @@ import joblib
 import pandas as pd
 import websockets
 
+from anomaly_detection import SHARED_DELTA_COLUMNS
 from db_path import default_db_path
 from feature_engineering import (
     WINDOWS,
@@ -50,6 +51,21 @@ from time_to_leak import ANOMALY_THRESHOLD, estimate_time_to_leak, fit_trend, fo
 DEFAULT_DB_PATH = default_db_path()
 MODELS_DIR = Path(__file__).parent / "models"
 POSITIONS = ["start", "middle", "end"]
+
+# Simulated-mode scoring (see PIPE_SIM_TOGGLE in full-prod-final.py): rather
+# than a trained IsolationForest, this is a deliberate rule — a position
+# counts as leaking if and only if ITS OWN moisture sensor reads wet.
+# Pressure alone never decides it: a hole partway down a pipe starves
+# downstream pressure without that downstream zone itself leaking (e.g. the
+# simulated pipe-3 "end" position reads ~0 kPa but stays dry), and per-device
+# statistical baselines can't catch a pipe that's been leaking since the
+# simulation started — there's no leak-free history for it to deviate from.
+# Pressure still nudges the score for texture in the trace display, weighted
+# low enough that it can never flip the moisture-decided sign.
+SIMULATED_HEALTHY_PRESSURE = 35.0
+SIMULATED_PRESSURE_SPAN = 20.0
+SIMULATED_MOISTURE_WEIGHT = 0.6
+SIMULATED_PRESSURE_WEIGHT = 0.3
 
 BUFFER_MAXLEN = 400  # raw readings kept per device (enough for a 10min rolling window at a few-second rate)
 SCORE_HISTORY_LEN = 20  # matches time_to_leak.WINDOW_POINTS
@@ -210,6 +226,33 @@ def score_current(device_id: str, feat_row: pd.Series, position: str):
     }
 
 
+def simulated_score(feat_row: pd.Series, position: str):
+    status_col = f"moisture_{position}_status"
+    zscore_col = f"moisture_{position}_raw_zscore"
+    pressure_col = f"pressure_{position}_value"
+
+    status = str(feat_row.get(status_col) or "").strip().lower()
+    is_wet = status == "wet"
+    moisture_component = SIMULATED_MOISTURE_WEIGHT if is_wet else -SIMULATED_MOISTURE_WEIGHT
+
+    pressure_value = feat_row.get(pressure_col)
+    if pressure_value is None or pd.isna(pressure_value):
+        pressure_component = 0.0
+    else:
+        deviation = (SIMULATED_HEALTHY_PRESSURE - float(pressure_value)) / SIMULATED_PRESSURE_SPAN
+        pressure_component = SIMULATED_PRESSURE_WEIGHT * max(-1.0, min(1.0, deviation))
+
+    score = moisture_component + pressure_component
+    return {
+        "score": score,
+        "raw_decision": -score,
+        "is_anomaly": score > ANOMALY_THRESHOLD,
+        "columns": [zscore_col, pressure_col],
+        "input_vector": [feat_row.get(zscore_col), pressure_value],
+        "n_estimators": 0,
+    }
+
+
 def broadcast_prediction(payload: dict):
     if dashboard_clients:
         websockets.broadcast(dashboard_clients, json.dumps(payload))
@@ -234,6 +277,7 @@ def log_prediction(payload: dict):
 
 async def process_update(device_id: str, data: dict):
     ts = datetime.now().isoformat()
+    is_simulated = bool(data.get("simulated"))
     state = device_states.setdefault(device_id, DeviceState())
     state.raw_rows.extend(rows_from_payload(ts, device_id, data))
 
@@ -243,7 +287,7 @@ async def process_update(device_id: str, data: dict):
     feat_row = feats.iloc[-1]
 
     for position in POSITIONS:
-        result = score_current(device_id, feat_row, position)
+        result = simulated_score(feat_row, position) if is_simulated else score_current(device_id, feat_row, position)
         if result is None:
             continue
         score = result["score"]
@@ -285,7 +329,10 @@ async def process_update(device_id: str, data: dict):
         pressure_z = safe_num(feat_row.get(f"{pressure_col}_zscore"))
         driver_label = primary_driver(feat_row, position)
 
-        delta_cols = [c for c in result["columns"] if "minus" in c]
+        if is_simulated:
+            delta_cols = [c for c in SHARED_DELTA_COLUMNS.get(position, []) if c in feat_row.index]
+        else:
+            delta_cols = [c for c in result["columns"] if "minus" in c]
         wet_col = f"moisture_{position}_wet_seconds"
 
         trace = {
@@ -304,11 +351,15 @@ async def process_update(device_id: str, data: dict):
                 "n_features": len(result["columns"]),
             },
             "model_output": {
-                "algorithm": "IsolationForest",
+                "algorithm": "Simulated (moisture-gated rule)" if is_simulated else "IsolationForest",
                 "n_estimators": result["n_estimators"],
                 "raw_decision_function": safe_num(result["raw_decision"]),
                 "anomaly_score": safe_num(score),
-                "score_formula": "anomaly_score = -decision_function(input_vector)",
+                "score_formula": (
+                    "anomaly_score = (+0.6 if wet else -0.6) + clip(pressure_deviation, -1, 1) * 0.3"
+                    if is_simulated
+                    else "anomaly_score = -decision_function(input_vector)"
+                ),
                 "threshold": ANOMALY_THRESHOLD,
                 "is_anomaly": bool(is_anomaly),
             },
